@@ -10,7 +10,10 @@ from typing import Optional
 
 import aiohttp
 import aiofiles
-from moviepy import VideoFileClip, concatenate_videoclips
+import requests
+import numpy as np
+from PIL import Image
+from moviepy import VideoFileClip, concatenate_videoclips, ImageClip, CompositeVideoClip
 
 logger = logging.getLogger(__name__)
 
@@ -132,6 +135,114 @@ def concat_videos(
                 clip.close()
             except Exception:
                 pass
+
+
+def _download_image_to_array(url: str, width: int = 1080, height: int = 1920) -> Optional[np.ndarray]:
+    """下载图片并调整为 TikTok 竖屏尺寸，返回 numpy 数组。"""
+    try:
+        from io import BytesIO
+        resp = requests.get(url, timeout=30)
+        resp.raise_for_status()
+        img = Image.open(BytesIO(resp.content)).convert("RGB")
+        # 保持宽高比裁剪填充
+        img_w, img_h = img.size
+        scale = max(width / img_w, height / img_h)
+        new_w = int(img_w * scale)
+        new_h = int(img_h * scale)
+        img = img.resize((new_w, new_h), Image.LANCZOS)
+        left = (new_w - width) // 2
+        top = (new_h - height) // 2
+        img = img.crop((left, top, left + width, top + height))
+        return np.array(img)
+    except Exception as e:
+        logger.warning(f"[Composer] 图片下载失败 {url[:60]}: {e}")
+        return None
+
+
+def create_slideshow_from_images(
+    image_urls: list[Optional[str]],
+    output_path: str,
+    duration_per_scene: float = 3.0,
+    width: int = 1080,
+    height: int = 1920,
+) -> str:
+    """用 Leonardo 静态图片制作幻灯片兜底视频（Ken Burns 缩放效果）。
+
+    当 Kling 全部失败时调用此函数，至少给用户一个可用的视频产出。
+
+    Args:
+        image_urls: 图片 URL 列表（None 跳过）
+        output_path: 输出文件路径
+        duration_per_scene: 每张图停留时长（秒）
+        width: 视频宽度
+        height: 视频高度
+
+    Returns:
+        输出文件路径
+
+    Raises:
+        RuntimeError: 无可用图片
+    """
+    valid_urls = [u for u in image_urls if u]
+    if not valid_urls:
+        raise RuntimeError("[Composer] 幻灯片兜底：无可用图片 URL")
+
+    logger.info(f"[Composer] 幻灯片模式：处理 {len(valid_urls)} 张图片")
+    clips = []
+    for i, url in enumerate(valid_urls):
+        arr = _download_image_to_array(url, width, height)
+        if arr is None:
+            continue
+        # Ken Burns：轻微放大 + 慢慢缩回，制造动感
+        zoom_start, zoom_end = 1.08, 1.0
+
+        def make_frame(t, _arr=arr, _dur=duration_per_scene, _zs=zoom_start, _ze=zoom_end):
+            progress = t / _dur
+            zoom = _zs + (_ze - _zs) * progress
+            h, w = _arr.shape[:2]
+            new_w = int(w / zoom)
+            new_h = int(h / zoom)
+            x1 = (w - new_w) // 2
+            y1 = (h - new_h) // 2
+            cropped = _arr[y1:y1 + new_h, x1:x1 + new_w]
+            return np.array(Image.fromarray(cropped).resize((w, h), Image.BILINEAR))
+
+        clip = ImageClip(_arr, duration=duration_per_scene).with_make_frame(make_frame)
+        clips.append(clip)
+        logger.info(f"[Composer] 幻灯片 {i+1}/{len(valid_urls)} 准备完成")
+
+    if not clips:
+        raise RuntimeError("[Composer] 幻灯片兜底：所有图片下载失败")
+
+    final = concatenate_videoclips(clips, method="compose")
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+    final.write_videofile(
+        output_path,
+        fps=VIDEO_FPS,
+        codec=VIDEO_CODEC,
+        bitrate=VIDEO_BITRATE,
+        audio_codec=AUDIO_CODEC,
+        logger=None,
+    )
+    for clip in clips:
+        try:
+            clip.close()
+        except Exception:
+            pass
+    logger.info(f"[Composer] ✅ 幻灯片视频保存至: {output_path}")
+    return output_path
+
+
+async def create_slideshow_async(
+    image_urls: list[Optional[str]],
+    output_path: str,
+    duration_per_scene: float = 3.0,
+) -> str:
+    """异步版幻灯片合成（线程池中运行）。"""
+    return await asyncio.get_event_loop().run_in_executor(
+        None,
+        lambda: create_slideshow_from_images(image_urls, output_path, duration_per_scene),
+    )
 
 
 async def compose_final_video(

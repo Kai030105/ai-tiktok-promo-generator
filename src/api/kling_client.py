@@ -233,7 +233,7 @@ async def generate_video_async(
 async def generate_videos_parallel(
     scenes: list[dict],
     duration: int = 5,
-) -> list[Optional[str]]:
+) -> tuple[list[Optional[str]], list[str]]:
     """并行生成多段视频（9 个场景同时提交，异步轮询）。
 
     Args:
@@ -241,20 +241,31 @@ async def generate_videos_parallel(
         duration: 每段视频时长秒数
 
     Returns:
-        视频 URL 列表（失败的场景对应 None）
+        (urls, errors) 元组：
+        - urls: 视频 URL 列表（失败的场景对应 None）
+        - errors: 各场景失败原因列表（成功的对应空字符串）
     """
-    async def _safe_generate(scene: dict) -> Optional[str]:
+    async def _safe_generate(scene: dict) -> tuple[Optional[str], str]:
         try:
-            return await generate_video_async(
+            url = await generate_video_async(
                 image_url=scene["image_url"],
                 prompt=scene["video_prompt"],
                 duration=duration,
             )
+            return url, ""
         except Exception as e:
-            logger.error(f"[Kling] 场景 {scene.get('id')} 视频生成失败: {e}")
-            return None
+            err = str(e)
+            logger.error(f"[Kling] 场景 {scene.get('id')} 视频生成失败: {err}")
+            return None, err
 
     tasks = [_safe_generate(scene) for scene in scenes]
-    results = await asyncio.gather(*tasks)
-    logger.info(f"[Kling] 并行生成完成，成功 {sum(1 for r in results if r)} / {len(results)}")
-    return list(results)
+    pairs = await asyncio.gather(*tasks)
+    urls = [p[0] for p in pairs]
+    errors = [p[1] for p in pairs]
+    success = sum(1 for u in urls if u)
+    logger.info(f"[Kling] 并行生成完成，成功 {success} / {len(urls)}")
+    if success == 0 and errors:
+        # 取第一个非空错误作为代表原因
+        sample = next((e for e in errors if e), "未知原因")
+        logger.error(f"[Kling] 全部失败，代表性错误: {sample}")
+    return urls, errors

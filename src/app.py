@@ -12,7 +12,7 @@ from agents.creative_planner import analyze_and_plan
 from api.leonardo_client import generate_storyboard_images
 from api.kling_client import generate_videos_parallel
 from core.storyboard import compose_storyboard_async
-from core.video_composer import compose_final_video
+from core.video_composer import compose_final_video, create_slideshow_async
 
 logging.basicConfig(
     level=logging.INFO,
@@ -90,29 +90,55 @@ async def _run_pipeline(
             scene["image_url"] = url or ""
         scenes_with_imgs = [s for s in scenes if s.get("image_url")]
 
-        video_urls = await generate_videos_parallel(
+        img_success = sum(1 for u in image_urls if u)
+        if not scenes_with_imgs:
+            return storyboard_path, "", (
+                f"⚠️ Leonardo 图片全部失败（0/9），无法生成视频\n"
+                f"请检查 Leonardo API Key 是否有效"
+            )
+
+        video_urls, kling_errors = await generate_videos_parallel(
             scenes=scenes_with_imgs,
             duration=video_duration,
         )
 
         # 阶段 5: 下载 + 拼接视频
-        progress(0.90, desc="✂️ 拼接最终视频…")
-        logger.info("[Pipeline] 阶段5: 视频合成")
         final_video_path = str(OUTPUT_DIR / f"tiktok_{ts}.mp4")
-        await compose_final_video(
-            video_urls=video_urls,
-            output_path=final_video_path,
-            temp_dir=str(TEMP_DIR / str(ts)),
-        )
+        kling_success = sum(1 for u in video_urls if u)
 
-        progress(1.0, desc="✅ 完成！")
-        success_count = sum(1 for u in video_urls if u)
-        status = (
-            f"✅ 生成完成！\n"
-            f"- 分镜图：{sum(1 for u in image_urls if u)}/9 成功\n"
-            f"- 视频片段：{success_count}/{len(scenes_with_imgs)} 成功\n"
-            f"- 最终视频：{Path(final_video_path).name}"
-        )
+        if kling_success == 0:
+            # Kling 全部失败 → 降级到幻灯片模式
+            sample_err = next((e for e in kling_errors if e), "未知原因")
+            logger.warning(f"[Pipeline] Kling 全部失败，降级幻灯片模式。原因: {sample_err}")
+            progress(0.90, desc="⚠️ Kling 失败，改用幻灯片模式…")
+            await create_slideshow_async(
+                image_urls=image_urls,
+                output_path=final_video_path,
+                duration_per_scene=float(video_duration),
+            )
+            progress(1.0, desc="✅ 完成（幻灯片模式）")
+            status = (
+                f"⚠️ 幻灯片模式（Kling 全部失败）\n"
+                f"- 分镜图：{img_success}/9 成功\n"
+                f"- Kling 错误：{sample_err}\n"
+                f"- 最终视频：{Path(final_video_path).name}（静态幻灯片）"
+            )
+        else:
+            progress(0.90, desc="✂️ 拼接最终视频…")
+            logger.info("[Pipeline] 阶段5: 视频合成")
+            await compose_final_video(
+                video_urls=video_urls,
+                output_path=final_video_path,
+                temp_dir=str(TEMP_DIR / str(ts)),
+            )
+            progress(1.0, desc="✅ 完成！")
+            status = (
+                f"✅ 生成完成！\n"
+                f"- 分镜图：{img_success}/9 成功\n"
+                f"- 视频片段：{kling_success}/{len(scenes_with_imgs)} 成功\n"
+                f"- 最终视频：{Path(final_video_path).name}"
+            )
+
         return storyboard_path, final_video_path, status
 
     except Exception as e:
