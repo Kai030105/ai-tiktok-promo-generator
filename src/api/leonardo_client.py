@@ -198,7 +198,6 @@ def generate_image(
             "initImageType": "UPLOADED",
             "preprocessorId": 67,
             "strengthType": "Mid",
-            "weight": init_strength,
         }]
 
     data = _request_with_retry("POST", f"{LEONARDO_BASE_URL}/generations", json=body)
